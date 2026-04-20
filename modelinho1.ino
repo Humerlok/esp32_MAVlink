@@ -1,15 +1,20 @@
 #include <Arduino.h>
+
 extern "C" {
   #include "mavlink/ardupilotmega/mavlink.h"
 }
 
-// UART (Serial2 no ESP32)
+// UART2 (ajuste se quiser)
 #define RXD2 16
 #define TXD2 17
 
+// IDs MAVLink
 uint8_t system_id = 1;
 uint8_t component_id = 200;
+uint8_t target_system = 1;
+uint8_t target_component = 1;
 
+// ===================== HEARTBEAT =====================
 void send_heartbeat() {
   mavlink_message_t msg;
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
@@ -27,6 +32,25 @@ void send_heartbeat() {
   Serial2.write(buf, len);
 }
 
+// ===================== STATUSTEXT =====================
+void send_status_text(const char* text, uint8_t severity) {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  mavlink_msg_statustext_pack(
+    system_id,
+    component_id,
+    &msg,
+    severity,
+    text,
+    0, 0
+  );
+
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  Serial2.write(buf, len);
+}
+
+// ===================== DISARM =====================
 void send_disarm() {
   mavlink_message_t msg;
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
@@ -35,8 +59,8 @@ void send_disarm() {
     system_id,
     component_id,
     &msg,
-    1, // target system (Cube)
-    1, // target component
+    target_system,
+    target_component,
     MAV_CMD_COMPONENT_ARM_DISARM,
     0,
     0, // param1 = 0 → DISARM
@@ -47,25 +71,38 @@ void send_disarm() {
   Serial2.write(buf, len);
 }
 
+// ===================== SETUP =====================
 void setup() {
   Serial.begin(115200);
-
   Serial2.begin(57600, SERIAL_8N1, RXD2, TXD2);
 
-  delay(5000); // deixa o Cube respirar
+  delay(2000); // deixa o Cube inicializar
 
-  Serial.println("Iniciando envio MAVLink...");
+  Serial.println("ESP32 MAVLink iniciado");
 }
 
+// ===================== LOOP =====================
 void loop() {
+
+  // envia heartbeat sempre
   send_heartbeat();
 
-  static unsigned long lastCmd = 0;
+  static unsigned long last_msg = 0;
+  static unsigned long last_cmd = 0;
 
-  if (millis() - lastCmd > 3000) {
+  // envia mensagem pro Mission Planner
+  if (millis() - last_msg > 3000) {
+    Serial.println("Enviando STATUSTEXT...");
+    send_status_text("ESP32 ONLINE", MAV_SEVERITY_INFO);
+    last_msg = millis();
+  }
+
+  // envia comando de disarm (teste)
+  if (millis() - last_cmd > 10000) {
     Serial.println("Enviando DISARM...");
+    send_status_text("DISARM CMD SENT", MAV_SEVERITY_WARNING);
     send_disarm();
-    lastCmd = millis();
+    last_cmd = millis();
   }
 
   delay(1000);
