@@ -33,6 +33,23 @@ void send_heartbeat() {
   uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
   Serial2.write(buf, len);
 }
+// ===================== STATUSTEXT =====================
+void send_status_text(const char* text, uint8_t severity) {
+  mavlink_message_t msg;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+
+  mavlink_msg_statustext_pack(
+    system_id,
+    component_id,
+    &msg,
+    severity,
+    text,
+    0, 0
+  );
+
+  uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+  Serial2.write(buf, len);
+}
 
 // Função genérica para enviar COMMAND_LONG
 void send_command_long(uint16_t command, float p1, float p2 = 0, float p3 = 0, float p4 = 0, float p5 = 0, float p6 = 0, float p7 = 0) {
@@ -71,7 +88,7 @@ void set_mode(uint32_t custom_mode) {
 }
 
 void setup() {
-  Serial.begin(00);
+  Serial.begin(57600);
   Serial2.begin(57600, SERIAL_8N1, RXD2, TXD2);
 
   delay(2000);
@@ -94,20 +111,25 @@ void loop() {
 
     if (input == "arm") {
       arm_drone();
+      send_status_text("DRONE ARM", MAV_SEVERITY_INFO);
     } 
     else if (input == "disarm") {
       disarm_drone();
+      send_status_text("DRONE DISARM", MAV_SEVERITY_INFO);
     } 
     else if (input == "stabilize") {
       Serial.println(">>> Mudando para STABILIZE");
+      send_status_text("DRONE STABILIZE", MAV_SEVERITY_INFO);
       set_mode(MODE_STABILIZE);
     } 
     else if (input == "althold") {
       Serial.println(">>> Mudando para ALTHOLD");
+      send_status_text("DRONE ALT_HOLD", MAV_SEVERITY_INFO);
       set_mode(MODE_ALTHOLD);
     } 
     else if (input == "loiter") {
       Serial.println(">>> Mudando para LOITER");
+      send_status_text("DRONE LOITER", MAV_SEVERITY_INFO);
       set_mode(MODE_LOITER);
     }
     else if (input != "") {
