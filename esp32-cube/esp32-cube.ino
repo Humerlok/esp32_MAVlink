@@ -4,18 +4,18 @@ extern "C" {
 }
 
 // UART (Serial2 no ESP32)
-#define RXD2 16
-#define TXD2 17
+#define RXD2 12
+#define TXD2 13
 
 uint8_t system_id = 1;
-uint8_t component_id = 200;
+uint8_t component_id = 32;
 uint8_t target_system = 1;      // ID do Cube
 uint8_t target_component = 1;   // ID do Componente (Autopiloto)
 
 // Definições de Modos de Voo (ArduCopter)
 #define MODE_STABILIZE 0
 #define MODE_ALTHOLD   2
-#define MODE_LOITER     5
+#define MODE_LOITER    5
 
 void send_heartbeat() {
   mavlink_message_t msg;
