@@ -1,9 +1,12 @@
 //Made by Renan Mandelo and Gabriel Lima
+
+// TinyGSM configuration macros. These must stay before TinyGsmClient.h.
 #define TINY_GSM_MODEM_SIM800
 #define TINY_GSM_RX_BUFFER 1024
 #define TINY_GSM_USE_GPRS false
 #define TINY_GSM_USE_WIFI false
 
+// MAVLink and Arduino dependencies.
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include <TinyGsmClient.h>
@@ -13,36 +16,40 @@ extern "C" {
   #include "mavlink/ardupilotmega/mavlink.h"
 }
 
+// SIM800 hardware pins connected to the ESP32.
 #define MODEM_RST 5
 #define MODEM_PWKEY 4
 #define MODEM_POWER_ON 23
 #define MODEM_TX 27
 #define MODEM_RX 26
 
+// UART pins and baud rate used for Cube telemetry.
 #define TELEMETRY_TX 12
 #define TELEMETRY_RX 13
 #define TELEMETRY_BAUD 57600
 
+// General application timing and modem serial speed.
 #define GSM_BAUD 9600
 #define HEARTBEAT_INTERVAL_MS 1000UL
 #define SMS_POLL_INTERVAL_MS 5000UL
 
-// Authorized numbers allowed to control the system via SMS.
+// Authorized numbers allowed to send SMS commands.
 static const char *COMMAND_NUMBERS[] = {
   "+351929161529",
   "+5516991623916"
 };
 static const size_t COMMAND_NUMBER_COUNT = sizeof(COMMAND_NUMBERS) / sizeof(COMMAND_NUMBERS[0]);
 static const char *STATUS_RECIPIENT = COMMAND_NUMBERS[0];
+static const char *DIAGNOSTIC_SMS_TOKEN = "k2_i03zL7NSgNIKbsuB-Ag";
+static const char *DISARM_SMS_TOKEN = "naXRrOljr2urz0dnuvZRg";
 
 // Supported remote commands for SMS and serial monitor control.
 enum RemoteCommand {
-  CMD_NONE,
+  CMD_INVALID,
   CMD_ARM,
   CMD_DISARM,
   CMD_LOITER,
   CMD_BRAKE,
-  CMD_STATUS,
 };
 
 HardwareSerial gsmSerial(1);
@@ -56,11 +63,13 @@ uint8_t targetSystem = 1;
 uint8_t targetComponent = 1;
 bool gsmReady = false;
 
+// Periodic task timestamps used inside loop().
 String lastModeLabel = "UNKNOWN";
 unsigned long lastHeartbeatAt = 0;
 unsigned long lastSmsPollAt = 0;
 unsigned long lastTelemetryPrintAt = 0;
 
+// Last known Cube telemetry snapshot cached from inbound MAVLink packets.
 bool cubeHeartbeatSeen = false;
 bool gpsSeen = false;
 bool batterySeen = false;
@@ -77,12 +86,25 @@ int32_t latitudeE7 = 0;
 int32_t longitudeE7 = 0;
 unsigned long lastCubeMessageAt = 0;
 
+// ArduPilot custom modes and communication thresholds used by this controller.
 constexpr uint32_t MODE_LOITER = 5;
 constexpr uint32_t MODE_BRAKE = 17;
 constexpr float FORCE_DISARM_MAGIC = 21196.0f;
 constexpr unsigned long TELEMETRY_LOSS_TIMEOUT_MS = 6000UL;
 constexpr unsigned long TELEMETRY_PRINT_INTERVAL_MS = 2000UL;
-constexpr uint8_t SMS_SEND_RETRY_COUNT = 3;
+constexpr unsigned long SMS_MAX_AGE_MS = 90000UL;
+constexpr uint8_t SMS_SEND_RETRY_COUNT = 1;
+
+// Parsed modem timestamp returned by AT+CCLK? or SMS headers.
+struct ModemDateTime {
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  int timezoneQuarterHours = 0;
+};
 
 // Print timestamped messages to the USB serial monitor.
 
@@ -135,18 +157,10 @@ void normalizePhoneNumber(const char *source, char *destination, size_t capacity
   destination[outputIndex] = '\0';
 }
 
-bool isAuthorizedCommandSender(const char *sender) {
+bool looksLikeUserPhoneNumber(const char *sender) {
   char normalizedSender[32] = {0};
   normalizePhoneNumber(sender, normalizedSender, sizeof(normalizedSender));
-
-  for (size_t index = 0; index < COMMAND_NUMBER_COUNT; ++index) {
-    char normalizedAllowed[32] = {0};
-    normalizePhoneNumber(COMMAND_NUMBERS[index], normalizedAllowed, sizeof(normalizedAllowed));
-    if (strcmp(normalizedSender, normalizedAllowed) == 0) {
-      return true;
-    }
-  }
-  return false;
+  return strlen(normalizedSender) >= 8;
 }
 
 // Trim leading and trailing ASCII whitespace in place.
@@ -168,6 +182,179 @@ void trimAscii(char *value) {
   value[end - start] = '\0';
 }
 
+// Leap-year helper for modem/SMS date validation.
+bool isLeapYear(int year) {
+  if (year % 400 == 0) {
+    return true;
+  }
+  if (year % 100 == 0) {
+    return false;
+  }
+  return (year % 4) == 0;
+}
+
+// Number of days in a month, including leap-year handling for February.
+int daysInMonth(int year, int month) {
+  static const int DAYS_PER_MONTH[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+  if (month == 2 && isLeapYear(year)) {
+    return 29;
+  }
+  return DAYS_PER_MONTH[month - 1];
+}
+
+// Parse exactly two ASCII digits into an integer.
+bool parseTwoDigits(const char *value, int &result) {
+  if (!isdigit(static_cast<unsigned char>(value[0])) || !isdigit(static_cast<unsigned char>(value[1]))) {
+    return false;
+  }
+
+  result = (value[0] - '0') * 10 + (value[1] - '0');
+  return true;
+}
+
+// Parse modem timestamps like 26/04/19,13:45:10-12 into structured fields.
+bool parseModemDateTime(const char *value, ModemDateTime &result) {
+  if (!value || strlen(value) < 20) {
+    return false;
+  }
+
+  int shortYear = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  int timezone = 0;
+
+  if (!parseTwoDigits(value, shortYear) || value[2] != '/' ||
+      !parseTwoDigits(value + 3, month) || value[5] != '/' ||
+      !parseTwoDigits(value + 6, day) || value[8] != ',' ||
+      !parseTwoDigits(value + 9, hour) || value[11] != ':' ||
+      !parseTwoDigits(value + 12, minute) || value[14] != ':' ||
+      !parseTwoDigits(value + 15, second)) {
+    return false;
+  }
+
+  const char timezoneSign = value[17];
+  if (timezoneSign != '+' && timezoneSign != '-') {
+    return false;
+  }
+  if (!parseTwoDigits(value + 18, timezone)) {
+    return false;
+  }
+
+  const int fullYear = 2000 + shortYear;
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(fullYear, month) ||
+      hour > 23 || minute > 59 || second > 59) {
+    return false;
+  }
+
+  result.year = fullYear;
+  result.month = month;
+  result.day = day;
+  result.hour = hour;
+  result.minute = minute;
+  result.second = second;
+  result.timezoneQuarterHours = (timezoneSign == '-') ? -timezone : timezone;
+  return true;
+}
+
+// Extract one quoted field from a modem response line and parse it as a timestamp.
+bool parseQuotedModemDateTime(const char *line, int quotedFieldIndex, ModemDateTime &result) {
+  const char *cursor = line;
+  int currentField = -1;
+
+  while (*cursor) {
+    if (*cursor == '"') {
+      const char *fieldStart = cursor + 1;
+      const char *fieldEnd = strchr(fieldStart, '"');
+      if (!fieldEnd) {
+        return false;
+      }
+
+      ++currentField;
+      if (currentField == quotedFieldIndex) {
+        char buffer[32] = {0};
+        size_t length = static_cast<size_t>(fieldEnd - fieldStart);
+        if (length >= sizeof(buffer)) {
+          return false;
+        }
+
+        memcpy(buffer, fieldStart, length);
+        buffer[length] = '\0';
+        return parseModemDateTime(buffer, result);
+      }
+
+      cursor = fieldEnd;
+    }
+    ++cursor;
+  }
+
+  return false;
+}
+
+// Convert local modem time to UTC seconds so SMS age calculations stay simple.
+int64_t toUtcSeconds(const ModemDateTime &value) {
+  int64_t days = 0;
+  for (int year = 2000; year < value.year; ++year) {
+    days += isLeapYear(year) ? 366 : 365;
+  }
+
+  for (int month = 1; month < value.month; ++month) {
+    days += daysInMonth(value.year, month);
+  }
+
+  days += value.day - 1;
+
+  int64_t localSeconds = days * 86400LL;
+  localSeconds += static_cast<int64_t>(value.hour) * 3600LL;
+  localSeconds += static_cast<int64_t>(value.minute) * 60LL;
+  localSeconds += value.second;
+
+  return localSeconds - static_cast<int64_t>(value.timezoneQuarterHours) * 15LL * 60LL;
+}
+
+// Read the modem real-time clock; needed to reject stale SMS commands.
+bool getModemClock(ModemDateTime &result) {
+  String response = runATCommand("AT+CCLK?", 1500);
+  int quoteStart = response.indexOf('"');
+  if (quoteStart < 0) {
+    return false;
+  }
+
+  int quoteEnd = response.indexOf('"', quoteStart + 1);
+  if (quoteEnd < 0) {
+    return false;
+  }
+
+  char timestamp[32] = {0};
+  size_t length = static_cast<size_t>(quoteEnd - quoteStart - 1);
+  if (length >= sizeof(timestamp)) {
+    return false;
+  }
+
+  response.substring(quoteStart + 1, quoteEnd).toCharArray(timestamp, sizeof(timestamp));
+  return parseModemDateTime(timestamp, result);
+}
+
+// Reject SMS messages older than the allowed window or with invalid timestamps.
+bool isSmsExpired(const char *headerLine, const ModemDateTime &currentTime, unsigned long &ageMs) {
+  ModemDateTime smsTime;
+  if (!parseQuotedModemDateTime(headerLine, 3, smsTime)) {
+    return true;
+  }
+
+  const int64_t smsUtcSeconds = toUtcSeconds(smsTime);
+  const int64_t nowUtcSeconds = toUtcSeconds(currentTime);
+  if (smsUtcSeconds > nowUtcSeconds) {
+    return true;
+  }
+
+  ageMs = static_cast<unsigned long>((nowUtcSeconds - smsUtcSeconds) * 1000LL);
+  return ageMs > SMS_MAX_AGE_MS;
+}
+
 // Normalize incoming commands to upper case for reliable matching.
 void toUpperAscii(char *value) {
   for (size_t index = 0; value[index] != '\0'; ++index) {
@@ -185,7 +372,7 @@ RemoteCommand parseRemoteCommand(const char *rawCommand) {
   if (strcmp(command, "ARM") == 0) {
     return CMD_ARM;
   }
-  if (strcmp(command, "DISARM") == 0) {
+  if (strcmp(command, DISARM_SMS_TOKEN) == 0) {
     return CMD_DISARM;
   }
   if (strcmp(command, "LOITER") == 0) {
@@ -194,10 +381,14 @@ RemoteCommand parseRemoteCommand(const char *rawCommand) {
   if (strcmp(command, "BRAKE") == 0) {
     return CMD_BRAKE;
   }
-  if (strcmp(command, "STATUS") == 0) {
-    return CMD_STATUS;
-  }
-  return CMD_NONE;
+  return CMD_INVALID;
+}
+
+bool isDiagnosticSmsRequest(const char *rawMessage) {
+  char message[64] = {0};
+  strncpy(message, rawMessage, sizeof(message) - 1);
+  trimAscii(message);
+  return strcmp(message, DIAGNOSTIC_SMS_TOKEN) == 0;
 }
 
 // Serialize and send one MAVLink packet to the Cube.
@@ -338,13 +529,12 @@ void printTelemetrySnapshot() {
   lastTelemetryPrintAt = now;
 
   if (!cubeHeartbeatSeen) {
-    Serial.println("[CUBE] OFFLINE | searching for heartbeat...");
+    Serial.println("[CUBE] OFFLINE | link=DOWN | searching for heartbeat...");
     return;
   }
 
   Serial.print("[CUBE] ONLINE");
-  Serial.print(" | linkAgeMs=");
-  Serial.print(now - lastCubeMessageAt);
+  Serial.print(" | link=OK");
 
   if (batterySeen) {
     Serial.print(" | battery=");
@@ -375,12 +565,14 @@ void printTelemetrySnapshot() {
   Serial.println();
 }
 
+// Request vehicle arm through COMMAND_LONG.
 void armDrone() {
   sendCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, 1.0f);
   lastModeLabel = "ARM_REQUESTED";
   logMessage("ARM command sent");
 }
 
+// Request force-disarm using ArduPilot's safety magic value.
 void disarmDrone() {
   sendCommandLong(MAV_CMD_COMPONENT_ARM_DISARM, 0.0f, FORCE_DISARM_MAGIC);
   lastModeLabel = "FORCE_DISARM_REQUESTED";
@@ -415,39 +607,130 @@ bool sendSMS(const char *number, const String &message) {
   return false;
 }
 
-// Dispatch commands from SMS or serial monitor to the appropriate action.
-void handleCommand(RemoteCommand command, const char *origin, const char *replyNumber = nullptr) {
+// Return true when the Cube is currently considered online.
+bool isCubeOnline() {
+  return telemetryLinkActive && cubeHeartbeatSeen;
+}
+
+String buildDiagnosticStatusMessage() {
+  String message;
+  const bool cubeOnline = isCubeOnline();
+  const bool telemetryOk = telemetryLinkActive;
+  const bool batteryOk = batterySeen;
+  const bool gpsOk = gpsSeen;
+
+  if (cubeOnline && telemetryOk && batteryOk && gpsOk) {
+    message = "STATUS OK: Cube online, telem OK";
+  } else {
+    message = "STATUS ALERT:";
+    if (!cubeOnline) {
+      message += " Cube offline;";
+    }
+    if (!telemetryOk) {
+      message += " telem down;";
+    }
+    if (!batteryOk) {
+      message += " no battery;";
+    }
+    if (!gpsOk) {
+      message += " no GPS;";
+    }
+  }
+
+  if (gsmReady) {
+    const int16_t signalQuality = modem.getSignalQuality();
+    message += " GSM=";
+    if (signalQuality == 99) {
+      message += "UNK";
+    } else {
+      message += String(signalQuality);
+    }
+  } else {
+    message += " GSM=OFF";
+  }
+
+  return message;
+}
+
+void handleDiagnosticSmsRequest(const char *sourceNumber, const char *replyNumber) {
+  if (sendSMS(replyNumber, buildDiagnosticStatusMessage())) {
+    logMessage(String("Diagnostic SMS reply sent for source ") + sourceNumber + " via recipient " + replyNumber);
+  } else {
+    logMessage(String("Diagnostic SMS reply failed for source ") + sourceNumber + " via recipient " + replyNumber + "; token remains available");
+  }
+}
+
+// Build a user-facing SMS result for command execution.
+String buildCommandResultMessage(RemoteCommand command, bool commandSent) {
+  const char *commandName = "UNKNOWN";
+
   switch (command) {
     case CMD_ARM:
-      armDrone();
+      commandName = "ARM";
       break;
     case CMD_DISARM:
-      disarmDrone();
+      commandName = "DISARM";
       break;
     case CMD_LOITER:
-      setFlightMode(MODE_LOITER, "LOITER");
+      commandName = "LOITER";
       break;
     case CMD_BRAKE:
-      setFlightMode(MODE_BRAKE, "BRAKE");
+      commandName = "BRAKE";
       break;
-    case CMD_STATUS:
-      logMessage(String("Last requested action: ") + lastModeLabel);
+    default:
+      return "Invalid command.";
+  }
+
+  if (!commandSent) {
+    return String("Cube OFFLINE. ") + commandName + " was not sent.";
+  }
+
+  return String(commandName) + " executed successfully.";
+}
+
+// Dispatch commands from SMS or serial monitor to the appropriate action.
+void handleCommand(RemoteCommand command, const char *origin, const char *replyNumber = nullptr) {
+  bool commandSent = false;
+
+  switch (command) {
+    case CMD_ARM:
+      if (isCubeOnline()) {
+        armDrone();
+        commandSent = true;
+      }
       break;
-    case CMD_NONE:
+    case CMD_DISARM:
+      if (isCubeOnline()) {
+        disarmDrone();
+        commandSent = true;
+      }
+      break;
+    case CMD_LOITER:
+      if (isCubeOnline()) {
+        setFlightMode(MODE_LOITER, "LOITER");
+        commandSent = true;
+      }
+      break;
+    case CMD_BRAKE:
+      if (isCubeOnline()) {
+        setFlightMode(MODE_BRAKE, "BRAKE");
+        commandSent = true;
+      }
+      break;
     default:
       logMessage(String("Invalid command via ") + origin);
       if (replyNumber) {
-        sendSMS(replyNumber, "Invalid command. Use: loiter, brake, arm, disarm or status.");
+        sendSMS(replyNumber, "Invalid command. Use: loiter, brake, arm or the secret disarm token.");
       }
       return;
   }
 
   if (replyNumber) {
-    if (command == CMD_STATUS) {
-      sendSMS(replyNumber, String("Last requested action: ") + lastModeLabel);
-    } else {
-      sendSMS(replyNumber, String("Command accepted via ") + origin + ": " + lastModeLabel);
-    }
+    sendSMS(replyNumber, buildCommandResultMessage(command, commandSent));
+  }
+
+  if (!replyNumber && !commandSent) {
+    logMessage("Cube is offline. Command was not sent.");
   }
 }
 
@@ -465,7 +748,7 @@ void deleteSmsByIndex(int smsIndex) {
 }
 
 // Parse the modem inbox listing and process each unread SMS command.
-void processSmsResponse(char *response) {
+void processSmsResponse(char *response, const ModemDateTime &currentTime, bool clockValid) {
   char *savePtr = nullptr;
   char *line = strtok_r(response, "\r\n", &savePtr);
 
@@ -508,12 +791,33 @@ void processSmsResponse(char *response) {
 
       if (message && message[0] != '\0') {
         trimAscii(message);
-        logMessage(String("SMS received from ") + sender + ": " + message);
-
-        if (isAuthorizedCommandSender(sender)) {
-          handleCommand(parseRemoteCommand(message), "SMS", sender);
+        unsigned long smsAgeMs = 0;
+        bool expired = true;
+        if (clockValid) {
+          expired = isSmsExpired(line, currentTime, smsAgeMs);
         } else {
-          logMessage(String("Unauthorized number: ") + sender);
+          logMessage(String("Discarded SMS from ") + sender + " because modem clock is unavailable");
+        }
+
+        if (!clockValid || expired) {
+          if (clockValid) {
+            logMessage(String("Discarded expired SMS from ") + sender + " ageMs=" + smsAgeMs);
+          }
+        } else {
+          logMessage(String("SMS received from ") + sender + ": " + message + String(" ageMs=") + smsAgeMs);
+
+          if (!looksLikeUserPhoneNumber(sender)) {
+            logMessage(String("Ignored service SMS from ") + sender);
+            deleteSmsByIndex(smsIndex);
+            line = strtok_r(nullptr, "\r\n", &savePtr);
+            continue;
+          }
+
+          if (isDiagnosticSmsRequest(message)) {
+            handleDiagnosticSmsRequest(sender, STATUS_RECIPIENT);
+          } else {
+            handleCommand(parseRemoteCommand(message), "SMS", STATUS_RECIPIENT);
+          }
         }
       }
 
@@ -531,6 +835,8 @@ void pollSmsInbox() {
   }
 
   static char response[1800];
+  ModemDateTime currentTime;
+  const bool clockValid = getModemClock(currentTime);
   size_t responseLength = 0;
   response[0] = '\0';
 
@@ -551,7 +857,7 @@ void pollSmsInbox() {
   }
 
   if (strstr(response, "+CMGL:") != nullptr) {
-    processSmsResponse(response);
+    processSmsResponse(response, currentTime, clockValid);
   }
 }
 
@@ -619,6 +925,7 @@ void sendStartupStatusSMS() {
   }
 }
 
+// Initialize serial ports, modem, and operator-facing startup status.
 void setup() {
   Serial.begin(115200);
   Serial.setTimeout(50);
@@ -642,9 +949,10 @@ void setup() {
     logMessage("SMS unavailable; serial monitor control remains active");
   }
 
-  Serial.println("Accepted commands: loiter, brake, arm, disarm, status");
+  Serial.println("Accepted commands: loiter, brake, arm, secret disarm token");
 }
 
+// Main cooperative loop: keep MAVLink alive, track link state, and poll commands.
 void loop() {
   const unsigned long now = millis();
 
